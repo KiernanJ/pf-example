@@ -6,7 +6,6 @@ using PowerModels
 using PGLib
 import MathProgIncidence as MPIN
 import MathOptAI as MOAI
-using Printf
 import HSL_jll
 
 PythonCall.pyimport("sys").path.append(@__DIR__)
@@ -342,6 +341,28 @@ function get_inputs(pm::PowerModels.AbstractPowerModel)
 end
 
 """
+    strip_inequalities!(pm::PowerModels.AbstractPowerModel)
+
+Delete all variable bounds and inequality constraints from `pm.model`, leaving
+only the ACPF equality constraints. Re-add whatever bounds you need afterwards
+(e.g., from the bounds returned by `get_inputs`/`get_outputs`).
+"""
+function strip_inequalities!(pm::PowerModels.AbstractPowerModel)
+    for var in JuMP.all_variables(pm.model)
+        if JuMP.has_lower_bound(var)
+            JuMP.delete_lower_bound(var)
+        end
+        if JuMP.has_upper_bound(var)
+            JuMP.delete_upper_bound(var)
+        end
+    end
+    for con in MPIN.get_inequality_constraints(pm.model)
+        JuMP.delete(pm.model, con)
+    end
+    return pm
+end
+
+"""
     solve_powerflow(point)::Vector{Float64}
 
 Solve AC power flow for a PFDelta point and return a vector of outputs ordered
@@ -359,18 +380,7 @@ function solve_powerflow(point; silent = true)
     # build-opf implementation
     # ------------------------
     pm = PowerModels.instantiate_model(pm_data, PowerModels.ACPPowerModel, PowerModels.build_opf)
-    # Delete inequality constraints
-    for var in JuMP.all_variables(pm.model)
-        if JuMP.has_lower_bound(var)
-            JuMP.delete_lower_bound(var)
-        end
-        if JuMP.has_upper_bound(var)
-            JuMP.delete_upper_bound(var)
-        end
-    end
-    for con in MPIN.get_inequality_constraints(pm.model)
-        JuMP.delete(pm.model, con)
-    end
+    strip_inequalities!(pm)
     inputs, input_bounds = get_inputs(pm)
     n_inputs = length(inputs)
     outputs, output_names, output_bounds = get_outputs(pm)
@@ -400,371 +410,51 @@ function solve_powerflow(point; silent = true)
     return JuMP.value.(outputs)
 end
 
-function solve_maximum_error(i::Int, sense::String)
-    PythonCall.pyimport("sys").path.append(pwd())
-    VC = PythonCall.pyimport("vectorcanos")
-    torch = PythonCall.pyimport("torch")
+"""
+    load_canos(modelpath = "vectorcanos-trained.pt")
 
-    # Load CANOS NN model
-    #modelpath = joinpath("runs", "canos_task_1_1", "canos_k_steps15_hd128_lr5e-4_task_1_1_260116_121912", "model.pt")
-    modelpath = "vectorcanos-trained.pt"
+Load a saved `VectorCanos` wrapper. Returns `(nn, predictor)`, where `nn` is the
+Python module (for direct forward passes, `flatten_input`, etc.) and `predictor`
+is a `MathOptAI.PytorchModel` for embedding in a JuMP model.
+"""
+function load_canos(modelpath::AbstractString = "vectorcanos-trained.pt")
+    torch = PythonCall.pyimport("torch")
     nn = torch.load(modelpath, map_location="cpu")
     predictor = MOAI.PytorchModel(modelpath)
-
-    pm_data = PGLib.pglib("case14")
-    # What happens if I don't load the PFDelta data into PM?
-    # - I think it's fine. All the PM data that I need are are loaded as inputs to CANOS
-    #load_pfd_into_pm!(pm_data, py_x0)
-    pm = PowerModels.instantiate_model(pm_data, PowerModels.ACPPowerModel, PowerModels.build_opf)
-
-    inputs, input_bounds = get_inputs(pm)
-    outputs, output_names, output_bounds = get_outputs(pm)
-    name_to_output_index = Dict(name => i for (i, name) in enumerate(output_names))
-    n_inputs = length(inputs)
-    n_outputs = length(outputs)
-    input_lbs = first.(input_bounds)
-    input_ubs = last.(input_bounds)
-
-    # Delete bounds and inequalities from the original model
-    # I'll re-add bounds on input variables only
-    for var in JuMP.all_variables(pm.model)
-        if JuMP.has_lower_bound(var)
-            JuMP.delete_lower_bound(var)
-        end
-        if JuMP.has_upper_bound(var)
-            JuMP.delete_upper_bound(var)
-        end
-    end
-    for con in MPIN.get_inequality_constraints(pm.model)
-        JuMP.delete(pm.model, con)
-    end
-
-    nonconst_mask = .!isa.(inputs, Number)
-    JuMP.@constraint(pm.model, input_lbs[nonconst_mask] .<= inputs[nonconst_mask] .<= input_ubs[nonconst_mask])
-
-    # CANOS constraints
-    # We add these extra variables as a hacky workaround to make all inputs variables.
-    @variable(pm.model, moai_inputs[i = 1:n_inputs], start = 1.0)
-    @constraint(pm.model, moai_input_link, inputs .== moai_inputs)
-    cuda_available = PythonCall.pyconvert(Bool, torch.cuda.is_available())
-    device = cuda_available ? "cuda" : "cpu"
-    println("device = $device")
-    y, _ = MOAI.add_predictor(pm.model, predictor, moai_inputs; gray_box = true, device)
-
-    # Which objective we add depends on the type of bus. For PV and slack buses,
-    # we maximize the difference in reactive power. For PQ buses, we maximize the
-    # difference in voltage magnitude.
-    bustype = pm_data["bus"]["$i"]["bus_type"]
-    if bustype == 1
-        # Since reactive power can be an expression, I can't reliably use var PM.var
-        # to get it. I'd just like to get the corresponding index in the output vector.
-        # Maybe the best way to do this is to look it up from the output names?
-        output_idx = name_to_output_index["pq_vm[$i]"]
-    elseif bustype == 2
-        output_idx = name_to_output_index["pv_qg[$i]"]
-    elseif bustype == 3
-        output_idx = name_to_output_index["slack_qg[$i]"]
-    else
-        error("Unsupported bus type")
-    end
-    pf_output = outputs[output_idx]
-    nn_output = y[output_idx]
-    if sense == "min"
-        JuMP.@objective(pm.model, Min, nn_output - pf_output)
-    elseif sense == "max"
-        JuMP.@objective(pm.model, Max, nn_output - pf_output)
-    else
-        error("Unsupported objective sense")
-    end
-
-    ipopt = JuMP.optimizer_with_attributes(
-        Ipopt.Optimizer,
-        "linear_solver" => "ma57",
-        "print_user_options" => "yes",
-        "tol" => 1e-6,
-        "acceptable_tol" => 1e-4,
-        "max_iter" => 500,
-        "print_timing_statistics" => "yes",
-    )
-    JuMP.set_optimizer(pm.model, ipopt)
-    JuMP.optimize!(pm.model)
-
-    nvar = length(JuMP.all_variables(pm.model))
-    ncon = 0
-    for con in JuMP.all_constraints(pm.model; include_variable_in_set_constraints = true)
-        if con.shape == JuMP.ScalarShape()
-            ncon += 1
-        else
-            vno = JuMP.MOI.get(pm.model, JuMP.MOI.ConstraintSet(), con)
-            ncon += vno.output_dimension
-        end
-    end
-    jacobian_nnz = length(pm.model.moi_backend.optimizer.model.jacobian_sparsity)
-    hessian_nnz = length(pm.model.moi_backend.optimizer.model.hessian_sparsity)
-
-    termination_status = JuMP.termination_status(pm.model)
-    primal_status = JuMP.primal_status(pm.model)
-    solve_time = JuMP.solve_time(pm.model)
-    n_iter = JuMP.MOI.get(pm.model, JuMP.MOI.BarrierIterations())
-    println("Termination status: $termination_status")
-    if primal_status in (JuMP.FEASIBLE_POINT, JuMP.NEARLY_FEASIBLE_POINT)
-        point = JuMP.value.(inputs)
-        objective = JuMP.objective_value(pm.model)
-        py_point = torch.tensor(PythonCall.pybuiltins.list(point))
-        py_y_nn = nn(py_point).detach().numpy()
-        y_nn = PythonCall.pyconvert(Vector{Float64}, py_y_nn)
-        println("y_NN (model) = $nn_output = $(JuMP.value(y_nn[output_idx]))")
-        println("y_NN (CANOS) = $nn_output = $(JuMP.value(nn_output))")
-        println("y_PF         = $pf_output = $(JuMP.value(pf_output))")
-        nn_output_value = y_nn[output_idx]
-        pf_output_value = JuMP.value(pf_output)
-    else
-        point = missing
-        objective = missing
-        nn_output_value = missing
-        pf_output_value = missing
-    end
-
-    return point, (;
-        termination_status,
-        primal_status,
-        objective,
-        bustype,
-        output_idx,
-        nn_output = nn_output_value,
-        pf_output = pf_output_value,
-        solve_time,
-        n_iter,
-        nvar,
-        ncon,
-        jacobian_nnz,
-        hessian_nnz,
-    )
+    return nn, predictor
 end
 
 """
-Solve a minimum-deviation-from-training-point problem where the NN and PF outputs
-at the specified bus are constrained. The NN output is always constrained to be feasible
-(according to bounds on this output specified by the case data) while the PF output
-is constrained to be infeasible. `direction` controls whether we are constraining the
-PF output to be above the upper bound or below the lower bound.
-We constrain the PF output to violate the bound by a margin of 5% (or 0.05, whichever is larger).
+    add_canos_predictor!(pm, predictor; start = 1.0, device = nothing)
 
-Or should I do 0.05 for vm at PQ buses and 0.1 for q at slack and PV buses?
+Embed a vectorized CANOS model in `pm.model`. The NN inputs are linked to the
+PowerModels quantities returned by `get_inputs(pm)`, so the returned outputs `y`
+are ordered like `get_outputs(pm)`. `start` is a scalar or a vector of initial
+values for the NN inputs. `device` defaults to "cuda" if available, else "cpu".
+
+Returns `(y, moai_inputs, formulation)`.
 """
-function solve_constrained_error(i::Int, direction::String; training_point_index::Int = 0)
-    PythonCall.pyimport("sys").path.append(pwd())
-    VC = PythonCall.pyimport("vectorcanos")
-    torch = PythonCall.pyimport("torch")
-
-    # Load CANOS NN model
-    #modelpath = joinpath("runs", "canos_task_1_1", "canos_k_steps15_hd128_lr5e-4_task_1_1_260116_121912", "model.pt")
-    modelpath = "vectorcanos-trained.pt"
-    nn = torch.load(modelpath, map_location="cpu")
-    predictor = MOAI.PytorchModel(modelpath)
-
-    # Load dataset that we will use for target data
-    pfdelta_variants = PythonCall.pyimport("core.datasets.pfdelta_variants")
-    PFDeltaCANOS = pfdelta_variants.PFDeltaCANOS
-    root_dir = joinpath("data", "pfdelta_data")
-    dataset = PFDeltaCANOS(
-        add_bus_type=true,
-        case_name="case14",
-        model="CANOS",
-        root_dir=root_dir,
-        split="train",
-        task="1.1",
-    )
-
-    py_x0 = dataset[training_point_index]
-    py_x0_flat = nn.flatten_input(py_x0)
-    x0 = PythonCall.pyconvert(Vector{Float64}, py_x0_flat)
-
-    pm_data = PGLib.pglib("case14")
-    load_pfd_into_pm!(pm_data, py_x0)
-    pm = PowerModels.instantiate_model(pm_data, PowerModels.ACPPowerModel, PowerModels.build_opf)
-
-    inputs, input_bounds = get_inputs(pm)
-    outputs, output_names, output_bounds = get_outputs(pm)
-    name_to_output_index = Dict(name => i for (i, name) in enumerate(output_names))
+function add_canos_predictor!(
+    pm::PowerModels.AbstractPowerModel,
+    predictor;
+    start = 1.0,
+    device = nothing,
+)
+    inputs, _ = get_inputs(pm)
     n_inputs = length(inputs)
-    n_outputs = length(outputs)
-    input_lbs = first.(input_bounds)
-    input_ubs = last.(input_bounds)
-
-    # Delete bounds and inequalities from the original model
-    # I'll re-add bounds on input variables only
-    for var in JuMP.all_variables(pm.model)
-        if JuMP.has_lower_bound(var)
-            JuMP.delete_lower_bound(var)
-        end
-        if JuMP.has_upper_bound(var)
-            JuMP.delete_upper_bound(var)
-        end
-    end
-    for con in MPIN.get_inequality_constraints(pm.model)
-        JuMP.delete(pm.model, con)
-    end
-
-    nonconst_mask = .!isa.(inputs, Number)
-    JuMP.@constraint(pm.model, input_lbs[nonconst_mask] .<= inputs[nonconst_mask] .<= input_ubs[nonconst_mask])
-
-    # Minimize 1-norm of difference between inputs and our target inputs.
-    JuMP.@variable(pm.model, input_slack_pos[1:n_inputs] >= 0.0, start = 0.0)
-    JuMP.@variable(pm.model, input_slack_neg[1:n_inputs] >= 0.0, start = 0.0)
-    JuMP.@constraint(pm.model, input_slack_eqn,
-        inputs .- x0 .+ input_slack_pos .- input_slack_neg .== 0.0
+    # Inputs may be constants or expressions, but MathOptAI needs variables, so we
+    # link them to auxiliary variables.
+    moai_inputs = JuMP.@variable(
+        pm.model,
+        [i = 1:n_inputs],
+        start = start isa Number ? start : start[i],
+        base_name = "moai_inputs",
     )
-    JuMP.@objective(pm.model, Min, sum(input_slack_pos .+ input_slack_neg))
-
-    # CANOS constraints
-    # We add these extra variables as a hacky workaround to make all inputs variables.
-    @variable(pm.model, moai_inputs[i = 1:n_inputs], start = x0[i])
-    @constraint(pm.model, moai_input_link, inputs .== moai_inputs)
-    cuda_available = PythonCall.pyconvert(Bool, torch.cuda.is_available())
-    device = cuda_available ? "cuda" : "cpu"
-    println("device = $device")
-    y, _ = MOAI.add_predictor(pm.model, predictor, moai_inputs; gray_box = true, device)
-    pm_to_canos = Dict(zip(outputs, y))
-
-    bustype = pm_data["bus"]["$i"]["bus_type"]
-    if bustype == 1
-        margin = direction == "lower" ? 0.04 : 0.02
-        output_idx = name_to_output_index["pq_vm[$i]"]
-    elseif bustype == 2
-        margin = 0.1
-        output_idx = name_to_output_index["pv_qg[$i]"]
-    elseif bustype == 3
-        margin = 0.1
-        output_idx = name_to_output_index["slack_qg[$i]"]
-    else
-        error("Unsupported bus type")
+    JuMP.@constraint(pm.model, inputs .== moai_inputs)
+    if isnothing(device)
+        torch = PythonCall.pyimport("torch")
+        device = PythonCall.pyconvert(Bool, torch.cuda.is_available()) ? "cuda" : "cpu"
     end
-
-    nn_output = y[output_idx]
-    pf_output = outputs[output_idx]
-
-    output_lbs = first.(output_bounds)
-    output_ubs = last.(output_bounds)
-    # Ideally, we constraint all outputs to be feasible, but this seems to make the problem
-    # infeasible. So I'm just constraining the target output for now.
-    # The output values look fine as far as I can tell from quick visual inspection. Are
-    # these bounds unusually restrictive?
-    #JuMP.@constraint(pm.model, output_lbs .<= y .<= output_ubs)
-    JuMP.@constraint(pm.model, output_lbs[output_idx] <= y[output_idx] <= output_ubs[output_idx])
-
-    if direction == "upper"
-        println("Constraining PF output to violate an upper bound")
-        println("Upper bound of output $output_idx = $(output_ubs[output_idx])")
-        con = JuMP.@constraint(pm.model, outputs[output_idx] >= output_ubs[output_idx] + margin)
-        println("Constraint: $con")
-    elseif direction == "lower"
-        println("Constraining PF output to violate a lower bound")
-        println("Lower bound of output $output_idx = $(output_lbs[output_idx])")
-        con = JuMP.@constraint(pm.model, outputs[output_idx] <= output_lbs[output_idx] - margin)
-        println("Constraint: $con")
-    else
-        error("direction must be \"upper\" or \"lower\"")
-    end
-
-    ipopt = JuMP.optimizer_with_attributes(
-        Ipopt.Optimizer,
-        "linear_solver" => "ma57",
-        "print_user_options" => "yes",
-        "tol" => 1e-6,
-        "acceptable_tol" => 1e-4,
-        "max_iter" => 500,
-        "print_timing_statistics" => "yes",
-    )
-    JuMP.set_optimizer(pm.model, ipopt)
-    JuMP.optimize!(pm.model)
-
-    nvar = length(JuMP.all_variables(pm.model))
-    ncon = 0
-    for con in JuMP.all_constraints(pm.model; include_variable_in_set_constraints = true)
-        if con.shape == JuMP.ScalarShape()
-            ncon += 1
-        else
-            vno = JuMP.MOI.get(pm.model, JuMP.MOI.ConstraintSet(), con)
-            ncon += vno.output_dimension
-        end
-    end
-    jacobian_nnz = length(pm.model.moi_backend.optimizer.model.jacobian_sparsity)
-    hessian_nnz = length(pm.model.moi_backend.optimizer.model.hessian_sparsity)
-
-    termination_status = JuMP.termination_status(pm.model)
-    primal_status = JuMP.primal_status(pm.model)
-    solve_time = JuMP.solve_time(pm.model)
-    n_iter = JuMP.MOI.get(pm.model, JuMP.MOI.BarrierIterations())
-    println("Termination status: $termination_status")
-
-    input_names = get_input_names(pm)
-    if primal_status in (JuMP.FEASIBLE_POINT, JuMP.NEARLY_FEASIBLE_POINT)
-        point = JuMP.value.(inputs)
-        objective = JuMP.objective_value(pm.model)
-        py_point = torch.tensor(PythonCall.pybuiltins.list(point))
-        py_y_nn = nn(py_point).detach().numpy()
-        y_nn = PythonCall.pyconvert(Vector{Float64}, py_y_nn)
-        println("y_NN (model) = $nn_output = $(JuMP.value(nn_output))")
-        println("y_NN (CANOS) = $nn_output = $(JuMP.value(y_nn[output_idx]))")
-        println("y_PF         = $pf_output = $(JuMP.value(pf_output))")
-        nn_output_value = y_nn[output_idx]
-        pf_output_value = JuMP.value(pf_output)
-
-        println()
-        println("Compare deviations from initial input x0")
-        println("----------------------------------------")
-        println(@sprintf(
-            "%4s %10s %14s %14s %14s %14s %14s %3s",
-            "idx", "name", "value", "target", "error", "lb", "ub", "type",
-        ))
-        for i in 1:n_inputs
-            inp = inputs[i]
-            val = isa(inp, Number) ? inp : JuMP.value(inp)
-            target = x0[i]
-            err = abs(val - target)
-            if err <= 1e-4
-                continue
-            end
-            lb, ub = input_bounds[i]
-            if isa(inp, JuMP.VariableRef)
-                println(
-                    @sprintf(
-                        "%4d %10s %14.6f %14.6f %14.6f %14.6f %14.6f %3s",
-                        i, input_names[i], val, target, err, lb, ub, "var",
-                    )
-                )
-            else
-                kind = isa(inp, Number) ? "const" : "expr"
-                println(
-                    @sprintf(
-                        "%4d %10s %14.6f %14.6f %14.6f %14s %14s %3s",
-                        i, input_names[i], val, target, err, lb, ub, kind,
-                    )
-                )
-            end
-        end
-    else
-        point = missing
-        objective = missing
-        nn_output_value = missing
-        pf_output_value = missing
-    end
-
-    # TODO: record outputs
-    return point, (;
-        termination_status,
-        primal_status,
-        objective,
-        bustype,
-        output_idx,
-        nn_output = nn_output_value,
-        pf_output = pf_output_value,
-        solve_time,
-        n_iter,
-        nvar,
-        ncon,
-        jacobian_nnz,
-        hessian_nnz,
-    )
+    y, formulation = MOAI.add_predictor(pm.model, predictor, moai_inputs; gray_box = true, device)
+    return y, moai_inputs, formulation
 end
